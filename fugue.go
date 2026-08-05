@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 )
 
 const GZIP = true
@@ -264,9 +265,9 @@ func (t *Tree[T]) insertIntoSiblings(node *Node[T]) {
 		for ; i < len(rightSibs); i++ {
 			less := t.isLess(node.rightOrigin, rightSibs[i].rightOrigin)
 			sameRO := node.rightOrigin == rightSibs[i].rightOrigin
-			greaterSender := node.id.Sender > rightSibs[i].id.Sender
+			greaterID := node.id.Sender > rightSibs[i].id.Sender || (node.id.Sender == rightSibs[i].id.Sender && node.id.Counter > rightSibs[i].id.Counter)
 
-			if !(less || (sameRO && greaterSender)) {
+			if !(less || (sameRO && greaterID)) {
 				break
 			}
 		}
@@ -278,7 +279,8 @@ func (t *Tree[T]) insertIntoSiblings(node *Node[T]) {
 		leftSibs := parent.leftChildren
 		i := 0
 		for ; i < len(leftSibs); i++ {
-			if !(node.id.Sender > leftSibs[i].id.Sender) {
+			greaterID := node.id.Sender > leftSibs[i].id.Sender || (node.id.Sender == leftSibs[i].id.Sender && node.id.Counter > leftSibs[i].id.Counter)
+			if !greaterID {
 				break
 			}
 		}
@@ -589,10 +591,16 @@ func (t *Tree[T]) Load(saveData []byte) error {
 	readyNodes := []*Node[T]{}
 	pendingNodes := make(map[*Node[T]][]*Node[T])
 
-	for sender, bySender := range t.NodesByID {
-		if sender == "" {
-			continue
+	senders := make([]string, 0, len(t.NodesByID))
+	for sender := range t.NodesByID {
+		if sender != "" {
+			senders = append(senders, sender)
 		}
+	}
+	slices.Sort(senders)
+
+	for _, sender := range senders {
+		bySender := t.NodesByID[sender]
 		for _, node := range bySender {
 			if !node.hasRightOrigin || node.rightOrigin == nil {
 				readyNodes = append(readyNodes, node)
@@ -603,8 +611,8 @@ func (t *Tree[T]) Load(saveData []byte) error {
 	}
 
 	for len(readyNodes) > 0 {
-		node := readyNodes[len(readyNodes)-1]
-		readyNodes = readyNodes[:len(readyNodes)-1]
+		node := readyNodes[0]
+		readyNodes = readyNodes[1:]
 
 		t.insertIntoSiblings(node)
 
@@ -737,6 +745,10 @@ func (f *FugueMaxSimple[T]) deleteOne(index int) (Message[T], error) {
 }
 
 func (f *FugueMaxSimple[T]) ReceivePrimitive(msg Message[T]) error {
+	if msg.ID.Sender == f.replicaID && msg.ID.Counter >= f.counter {
+		f.counter = msg.ID.Counter + 1
+	}
+
 	switch msg.Type {
 	case OpInsert:
 		if msg.Parent == nil {
@@ -820,8 +832,24 @@ func (f *FugueMaxSimple[T]) LoadPrimitive(savedState []byte) error {
 			return fmt.Errorf("gzip decompress error: %w", err)
 		}
 	}
-	return f.tree.Load(data)
+	if err := f.tree.Load(data); err != nil {
+		return err
+	}
+
+	if nodes, ok := f.tree.NodesByID[f.replicaID]; ok {
+		maxCounter := -1
+		for _, node := range nodes {
+			if node != nil && node.id.Counter > maxCounter {
+				maxCounter = node.id.Counter
+			}
+		}
+		f.counter = maxCounter + 1
+	}
+
+	return nil
 }
+
+
 
 func gzipCompress(data []byte) ([]byte, error) {
 	var buf bytes.Buffer
